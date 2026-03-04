@@ -30,28 +30,67 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    permissions:
+      # `actions:write` permission is required to delete caches
+      #   See also: https://docs.github.com/en/rest/actions/cache?apiVersion=2022-11-28#delete-a-github-actions-cache-for-a-repository-using-a-cache-id
+      actions: write
+      contents: read
+    environment: tests
+    env:
+      SERIEUX_PASSWORD: ${{ secrets.SERIEUX_PASSWORD }}
     strategy:
       matrix:
         settings:
         - python: '3.13'
           coverage: false
     steps:
+    - name: Check required secrets
+      run: |
+        if [ -z "$SERIEUX_PASSWORD" ]
+        then
+          echo "::error::SERIEUX_PASSWORD secret is not set. Please configure it in the project's tests environment."
+          exit 1
+        fi
+    - name: Set month outputs
+      id: month
+      run: echo "month=$(date +%m)" >> $GITHUB_OUTPUT
+
     - name: Check out the code
       uses: actions/checkout@v3
     - name: Set up uv
       uses: hynek/setup-cached-uv@v2
       with:
         cache-dependency-path: uv.lock
+
+    - name: Restore tests cache
+      uses: actions/cache/restore@v5
+      id: restore-cache
+      with:
+        path: ./tests/cache/
+        # Reset the cache completely every month
+        key: tests-cache-${{ steps.month.outputs.month }}
+
+    - name: List tests cache
+      continue-on-error: true
+      run: ls -lR tests/cache/
+
     - name: Install Podman
       uses: gacts/install-podman@v1.1.1
     - name: Install and set up Hatch
       run: |
-        uv tool install hatch
+        # Hatch is incompatible with virtualenv 21.0.0 (propose_interpreters moved).
+        # See: https://github.com/pypa/hatch/pull/2195
+        uv tool install --with 'virtualenv!=21.0.0' hatch
         echo "HATCH_UV=$(which uv)" >>$GITHUB_ENV
     - name: Pin Python version
       run: uv python pin ${{ matrix.settings.python }}
     - name: Sync dependencies
       run: uv sync
+    - name: Set openreview token
+      env:
+        OPENREVIEW_USERNAME: ${{ secrets.OPENREVIEW_USERNAME }}
+        OPENREVIEW_PASSWORD: ${{ secrets.OPENREVIEW_PASSWORD }}
+      run: GIFNOC_FILE=tests/config/test-config.yaml uv run paperoni login openreview >/dev/null
     - name: Setup mongo
       run: hatch run mongo:start
     - name: Test with pytest
@@ -66,3 +105,39 @@ jobs:
     - name: Stop mongo
       if: always()
       run: hatch run mongo:stop
+
+    # Action cache cannot be overwritten for the same branch/key: If a cache
+    # entry with the same key, version, and scope exists, saving fails with
+    #
+    # Failed to CreateCacheEntry: Received non-retryable error: Failed request:
+    # (409) Conflict: cache entry with the same key, version, and scope already
+    # exists
+    #
+    # This step ensures old cache entries are deleted so that updated
+    # caches can be used for the next run.
+    - name: Cleanup cache
+      if: always()
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GH_REPO: ${{ github.repository }}
+        BRANCH: refs/pull/${{ github.event.pull_request.number }}/merge
+      run: |
+        echo "Fetching list of cache key"
+        cacheKeysForPR=$(gh cache list --ref $BRANCH --limit 100 --json id --jq '.[].id')
+
+        ## Setting this to not fail the workflow while deleting cache keys.
+        set +e
+        echo "Deleting caches..."
+        for cacheKey in $cacheKeysForPR
+        do
+            echo "Deleting cache key: $cacheKey"
+            gh cache delete $cacheKey
+        done
+        echo "Done"
+
+    - name: Store tests cache
+      if: always()
+      uses: actions/cache/save@v5
+      with:
+        path: ./tests/cache/
+        key: ${{ steps.restore-cache.outputs.cache-primary-key }}

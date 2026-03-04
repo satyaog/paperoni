@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import functools
 import itertools
 import json
 import logging
@@ -21,7 +22,7 @@ from filelock import FileLock
 from gifnoc import add_overlay, cli
 from outsight import outsight, send
 from outsight.ops import merge, ticktock
-from ovld import ovld
+from ovld import ovld, recurse
 from rapporteur.report import Report
 from serieux import (
     JSON,
@@ -242,6 +243,37 @@ class Refine:
         self.format(results)
 
 
+@ovld
+def expand_paper_links(xs: list):
+    return [recurse(x) for x in xs]
+
+
+@ovld
+def expand_paper_links(p: Scored):
+    return replace(p, value=recurse(p.value))
+
+
+@ovld
+def expand_paper_links(p: PaperWorkingSet):
+    return replace(
+        p,
+        current=recurse(p.current),
+        collected=recurse(p.collected),
+    )
+
+
+@ovld
+def expand_paper_links(p: Paper):
+    return replace(
+        p,
+        links=[
+            Link(type=l["type"], link=l["url"])
+            for l in expand_links_dict(p.links)
+            if "url" in l
+        ],
+    )
+
+
 @dataclass
 class Work:
     """Discover and work on prospective papers."""
@@ -280,7 +312,10 @@ class Work:
         check_paper_updates: bool = False
 
         async def run(self, work: "Work"):
-            ex = work.collection and (await work.collection.exclusions())
+            wcoll = (
+                (await work.collection.cached()) if work.collection is not None else None
+            )
+            ex = (await wcoll.exclusions()) if wcoll is not None else None
             index = paper_index()
             index.index_all(list(work.top))
 
@@ -298,8 +333,8 @@ class Work:
 
                 col_paper = None
                 if (
-                    work.collection
-                    and (col_paper := await work.collection.find_paper(paper))
+                    wcoll is not None
+                    and (col_paper := await wcoll.find_paper(paper))
                     and (
                         not self.check_paper_updates
                         or not paper_has_updated(col_paper, paper)
@@ -343,8 +378,14 @@ class Work:
         # Number of papers to view
         n: int = None
 
+        # Whether to expand links
+        expand_links: bool = False
+
         async def run(self, work: "Work"):
             worksets = itertools.islice(work.top, self.n) if self.n else work.top
+            worksets = (
+                expand_paper_links(list(worksets)) if self.expand_links else worksets
+            )
             match self.what:
                 case "title":
                     self.format(ws.value.current.title for ws in worksets)
@@ -419,7 +460,7 @@ class Work:
                     ):
                         send(refinement=paper)
                         sws.value.add(paper)
-                    sws.score = work.focuses.score(sws.value)
+                    sws.score = sws.value.current.score = work.focuses.score(sws.value)
                     return sws
 
                 coros = [
@@ -454,7 +495,8 @@ class Work:
                 with soft_fail():
                     p = normalize_paper(sws.value.current, **kwargs, force=self.force)
                     sws.value.current = simplify_paper(p)
-                    sws.score = work.focuses.score(sws.value)
+                    new_score = work.focuses.score(sws.value)
+                    sws.score = sws.score = sws.value.current.score = new_score
 
             work.top.resort()
             work.save()
@@ -509,7 +551,7 @@ class Work:
                 # file
                 work.save()
 
-            send(collection_include=added)
+            send(collection_include=len(added))
             return added
 
     @dataclass
@@ -645,16 +687,7 @@ class Coll:
         async def run(self, coll: "Coll") -> list[Paper]:
             flags = set() if self.flags is None else self.flags
             papers = [
-                replace(
-                    p,
-                    links=[
-                        Link(type=l["type"], link=l["url"])
-                        for l in expand_links_dict(p.links)
-                        if "url" in l
-                    ],
-                )
-                if self.expand_links
-                else p
+                expand_paper_links(p) if self.expand_links else p
                 async for p in coll.collection.search(
                     paper_id=self.paper_id,
                     title=self.title,
@@ -873,10 +906,14 @@ class Batch:
 
     # Path to the batch file
     # [positional]
-    batch_file: Path
+    batch_file: str
 
     async def run(self):
-        batch = deserialize(dict[str, PaperoniCommand], self.batch_file)
+        if config.batch_dir and "/" not in self.batch_file:
+            batch_file = config.batch_dir / self.batch_file
+        else:
+            batch_file = Path(self.batch_file)
+        batch = deserialize(dict[str, PaperoniCommand], batch_file)
         for name, cmd in batch.items():
             __trace__ = f"step:{name}"  # noqa: F841
             batch_descr = f"Batch: start step {name}"
@@ -983,6 +1020,8 @@ class Serve:
                     app,
                     host=config.server.host if self.host is None else self.host,
                     port=config.server.port if self.port is None else self.port,
+                    proxy_headers=True,
+                    forwarded_allow_ips="*",
                     reload=self.reload,
                     **ssl_kwargs,
                 )
@@ -994,17 +1033,44 @@ class Serve:
 
 
 @dataclass
-class Login:
-    """Retrieve an access token from the paperoni server."""
-
+class _PaperoniLogin:
     # Endpoint to login to
     endpoint: str = "http://localhost:8000"
 
-    # Whether to use headless mode
-    headless: bool = False
+    def login(self):
+        return login(self.endpoint)
+
+
+@dataclass
+class Login:
+    """Login to a service."""
+
+    @dataclass(frozen=True)
+    class LoginFromEntryPoint(FromEntryPoint):
+        @cached_property
+        def elements(self):
+            # hack to avoid FromEntryPoint.default=Auto[_PaperoniLogin.login]
+            # failing with:
+            # TypeError: sequence item 0: expected str instance, NoneType found
+
+            return {"paperoni": Auto[_PaperoniLogin.login]} | super().elements
+
+    service: Annotated[
+        Any,
+        LoginFromEntryPoint(
+            "paperoni.discovery",
+            wrap=lambda cls: Auto[cls.login] if getattr(cls, "login", None) else None,
+        ),
+    ] = "paperoni"
+
+    # When true, print only the token value
+    plain: bool = False
 
     async def run(self):
-        print_field("Access token", login(self.endpoint, self.headless))
+        _print_access_token = functools.partial(print_field, "Access token")
+        match token := self.service():
+            case str():
+                (print if self.plain else _print_access_token)(token)
 
 
 PaperoniCommand = TaggedUnion[

@@ -65,6 +65,7 @@ dev = [
 lint = [
     "ruff>=0.15.0",
 ]
+cloud = []
 
 [project.entry-points."paperoni.discovery"]
 semantic_scholar = "paperoni.discovery.semantic_scholar:SemanticScholar"
@@ -156,16 +157,16 @@ mongo = [
 ]
 
 [tool.hatch.envs.lint]
-installer = "uv"
 detached = true
+installer = "uv"
 dependency-groups = ["lint"]
 
 [tool.hatch.envs.lint.scripts]
 uv = 'UV_PROJECT_ENVIRONMENT="{env:VIRTUAL_ENV}" "$(which uv)" {args}'
 lint = [
     "uv sync --only-group lint",
-    "ruff check --fix",
-    "ruff format",
+    "uv run --only-group lint ruff check --fix",
+    "uv run --only-group lint ruff format",
 ]
 
 [tool.hatch.envs.pixi]
